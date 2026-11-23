@@ -1,0 +1,357 @@
+--- http-ratelimit -- rate limiting middleware for handl HTTP servers.
+---
+--- Sits in the `http-middleware` onion protocol: `rate_limit(opts)`
+--- returns `(ctx, next) ~> { resp, state }` — drop it into
+--- `mw.chain([mw.rate_limit({...}), ..., mw.end(router)])` anywhere a
+--- middleware belongs. It never imports http-middleware; the protocol
+--- is structural (`ctx = { req, state }`, pair results, bare-response
+--- normalization is the pipeline's job).
+---
+--- Algorithms (`opts.algorithm`):
+---   "bucket"  token bucket (default) — smooth bursts; state per key is
+---            `{ tokens, ts }` (tokens may be fractional).
+---   "window"  fixed window — simple counter per window;
+---            state per key is `{ start, count }`.
+---
+--- State: handl has no mutable cells, so counters live in ONE of two
+--- places:
+---   - `opts.store` — a `{ get: (key) ~> value|null, set: (key,value)
+---     ~> unit }` port record, same shape as http-middleware's session
+---     store. This is the production path: back it with lib-kv /
+---     kv_hashmap, a Redis client, a file, anything effectful. Single-
+---     process semantics for v1 — there is no shared store across
+---     workers yet.
+---   - no store — counters are kept in `ctx.state[opts.state_key]` as a
+---     `{ key: counter }` record threaded explicitly. This works for
+---     callers that carry ctx.state across requests (e.g. a
+---     `pipeline` driver feeding state back in) and for tests; under
+---     plain `serve`/`chain` each request starts with `state: {}` so
+---     the limit would never accumulate — pass a store for real use.
+---
+--- Key: `opts.key_fn(ctx) ~> String` overrides the default, which reads
+--- the client IP from `x-forwarded-for` (first hop) then `x-real-ip`,
+--- falling back to `"unknown"`. NOTE: the lib-http-rfc request record
+--- carries no peer address today (`{ method, target, path, query,
+--- version, headers, body, body_bytes }`), so without those headers
+--- all clients share the "unknown" bucket — inject `key_fn` (or have
+--- the edge set x-forwarded-for) for per-client limits.
+---
+--- Clock: `opts.now` is `() ~> ms` (default wall-clock `now_ms`);
+--- inject a fake for tests.
+---
+--- On allow the response gets `x-ratelimit-limit`,
+--- `x-ratelimit-remaining`, `x-ratelimit-reset` (epoch seconds);
+--- on deny it is `{ status: 429, body: "rate limit exceeded" }` with
+--- those headers plus `retry-after` (seconds, >= 1) and
+--- `x-ratelimit-remaining: 0`. `next` is never called on a deny.
+---
+--- opts (all optional):
+---   limit       Int, default 60        -- requests per window
+---   window      Int seconds (default 60) | { sec|seconds|ms|millis: n }
+---   algorithm   "bucket" | "window", default "bucket"
+---   burst       Int, default = limit   -- bucket capacity
+---   store       { get, set } port or null (see above)
+---   key_fn      (ctx) ~> String, default x-forwarded-for/x-real-ip
+---   now         () ~> ms, default wall-clock now_ms (built-in below)
+---   state_key   String, default "rate_limit" -- ctx.state slot for
+---               the no-store counter map
+---
+--- Exports:
+---   rate_limit(opts?)        ~> (ctx, next) ~> { resp, state }
+---   default_key(ctx)         ~> String      -- the default key_fn
+
+-- `str.*`/`hash_map.*`/`type.*`/`math.*`/`error.*`/`ffi.*` are
+-- registered wire names in every eval context — called bare, no
+-- import (same NOTE as lib-http-static). `posix-c`'s typed exports
+-- dispatch as host ops that `hnl` does not register cross-package,
+-- so the default clock calls libc `clock_gettime` through `ffi`
+-- directly (the mechanism posix-c's clock_gettime.hnl uses).
+LIBC := "libc.so.6"
+
+clock_ns := (clock_id) ~> do {
+  r := ffi.call(LIBC, "clock_gettime", [clock_id],
+    ["i32", "out_struct:{tv_sec:i64,tv_nsec:i64}"], "i32", false)
+  if r.ret < 0 {
+    error.raise("http-ratelimit: clock_gettime failed (errno "
+      + type.to_string(ffi.errno()) + ")")
+  } else {
+    r.buf.tv_sec * 1000000000 + r.buf.tv_nsec
+  }
+}
+
+-- wall-clock milliseconds (CLOCK_REALTIME); override via opts.now.
+now_ms := () ~> clock_ns(0) / 1000000
+
+-- ---------------------------------------------------------------------
+-- small helpers (same shapes as http-middleware's private ones)
+-- ---------------------------------------------------------------------
+
+is_obj   := (v) ~> type.of(v) == "object"
+is_arr   := (v) ~> type.of(v) == "array"
+is_str   := (v) ~> type.of(v) == "string"
+is_arrow := (v) ~> type.of(v) == "arrow"
+is_num   := (v) ~> type.of(v) == "number" || type.of(v) == "int"
+
+state_of := (ctx) ~> hash_map.get_or(ctx, "state", {})
+req_of   := (ctx) ~> hash_map.get_or(ctx, "req", {})
+
+opts_of := (o, d) ~> if is_obj(o) { o } else { d }
+opt     := (o, k, d) ~> hash_map.get_or(o, k, d)
+
+rest0 := (rest) ~> match rest {
+  [h, ..._t]: h,
+  []: null
+}
+
+--- fold `[[k, v], ...]` pairs into a headers record.
+put_hs := (hs, pairs) ~> while { xs: pairs, acc: hs } {
+  (xs, acc) ~> match xs {
+    []: { out: acc },
+    [[k, v], ...t]: { state: { xs: t, acc: hash_map.set(acc, k, v) } }
+  }
+}
+
+with_headers := (resp, pairs) ~> do {
+  if hash_map.get_or(resp, "headers", null) == null {
+    hash_map.merge(resp, { headers: put_hs({}, pairs) })
+  } else {
+    hash_map.merge(resp, { headers: put_hs(
+      hash_map.get_or(resp, "headers", {}), pairs) })
+  }
+}
+
+str_of := (v) ~> if is_str(v) { v } else { type.to_string(v) }
+
+-- ---------------------------------------------------------------------
+-- key extraction
+-- ---------------------------------------------------------------------
+
+--- first `name=value`-style token out of a comma list header, or null.
+first_token := (hdr) ~> do {
+  parts := str.split(hdr, ",")
+  while { xs: parts, found: null } {
+    (xs, found) ~> match xs {
+      []: { out: found },
+      [s, ...t]: do {
+        v := str.trim(s)
+        if found == null && v != "" {
+          { out: v }
+        } else {
+          { state: { xs: t, found: found } }
+        }
+      }
+    }
+  }
+}
+
+--- default rate-limit key: client IP from forwarding headers.
+--- `x-forwarded-overflow`-style lists yield their FIRST hop. Falls back
+--- to "unknown" — the request record has no peer address (see module
+--- doc); inject `key_fn` for real per-client limits.
+export default_key := (ctx) ~> do {
+  hs := hash_map.get_or(req_of(ctx), "headers", {})
+  xff := hash_map.get_or(hs, "x-forwarded-for", null)
+  rip := hash_map.get_or(hs, "x-real-ip", null)
+  k := if is_str(xff) && str.is_empty(str.trim(xff)) == false {
+    first_token(xff)
+  } else if is_str(rip) && str.is_empty(str.trim(rip)) == false {
+    str.trim(rip)
+  } else {
+    null
+  }
+  if k == null { "unknown" } else { k }
+}
+
+-- ---------------------------------------------------------------------
+-- option normalization
+-- ---------------------------------------------------------------------
+
+--- window spec -> milliseconds. Int = seconds; record accepts
+--- { sec|seconds|ms|millis: n }.
+window_ms := (w) ~> do {
+  if is_num(w) {
+    w * 1000
+  } else if is_obj(w) {
+    do {
+      ms := hash_map.get_or(w, "ms",
+        hash_map.get_or(w, "millis",
+          hash_map.get_or(w, "sec",
+            hash_map.get_or(w, "seconds", null))))
+      if ms == null {
+        error.raise("http-ratelimit: window record needs " +
+          "sec/seconds/ms/millis")
+      } else if hash_map.has(w, "ms") || hash_map.has(w, "millis") {
+        ms
+      } else {
+        ms * 1000
+      }
+    }
+  } else {
+    error.raise("http-ratelimit: window must be seconds Int or " +
+      "{ sec|seconds|ms|millis: n }")
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- algorithms: pure step functions over (prev_state, now) -> eval record
+--   { allowed, tokens|start, count|ts, remaining, reset_ms, retry_ms }
+-- ---------------------------------------------------------------------
+
+bucket_eval := (prev, now, limit, wms, burst) ~> do {
+  pt := if prev == null {
+    burst
+  } else {
+    hash_map.get_or(prev, "tokens", burst)
+  }
+  pts := if prev == null {
+    now
+  } else {
+    hash_map.get_or(prev, "ts", now)
+  }
+  elapsed := if now > pts { now - pts } else { 0 }
+  -- `/` is integer division on Int operands; math.div is the float one
+  rate := math.div(limit, wms)
+  toks := pt + elapsed * rate
+  toks2 := if toks > burst { burst } else { toks }
+  if toks2 >= 1 {
+    rem := toks2 - 1
+    { allowed: true, tokens: rem, ts: now,
+      remaining: math.floor(rem),
+      reset_ms: now + (burst - rem) / rate,
+      retry_ms: 0 }
+  } else {
+    { allowed: false, tokens: toks2, ts: now,
+      remaining: 0,
+      reset_ms: now + (1 - toks2) / rate,
+      retry_ms: (1 - toks2) / rate }
+  }
+}
+
+window_eval := (prev, now, limit, wms) ~> do {
+  ps := if prev == null {
+    -1
+  } else {
+    hash_map.get_or(prev, "start", -1)
+  }
+  pc := if prev == null {
+    0
+  } else {
+    hash_map.get_or(prev, "count", 0)
+  }
+  if ps < 0 || now - ps >= wms {
+    { allowed: true, start: now, count: 1,
+      remaining: limit - 1, reset_ms: now + wms, retry_ms: 0 }
+  } else if pc + 1 <= limit {
+    { allowed: true, start: ps, count: pc + 1,
+      remaining: limit - (pc + 1), reset_ms: ps + wms, retry_ms: 0 }
+  } else {
+    { allowed: false, start: ps, count: pc,
+      remaining: 0, reset_ms: ps + wms,
+      retry_ms: ps + wms - now }
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- rate_limit
+-- ---------------------------------------------------------------------
+
+--- rate_limit(opts?) -> (ctx, next) ~> { resp, state }.
+export rate_limit := (...rest) ~> do {
+  o := opts_of(rest0(rest), {})
+  limit   := opt(o, "limit", 60)
+  wms     := window_ms(opt(o, "window", 60))
+  algo    := opt(o, "algorithm", "bucket")
+  burst   := opt(o, "burst", limit)
+  store   := opt(o, "store", null)
+  keyf    := opt(o, "key_fn", default_key)
+  nowf    := opt(o, "now", now_ms)
+  skey    := opt(o, "state_key", "rate_limit")
+
+  if is_num(limit) == false || limit < 1 {
+    error.raise("http-ratelimit: limit must be a positive number")
+  } else if algo != "bucket" && algo != "window" {
+    error.raise("http-ratelimit: algorithm must be \"bucket\" " +
+      "or \"window\"")
+  } else if is_arrow(keyf) == false || is_arrow(nowf) == false {
+    error.raise("http-ratelimit: key_fn and now must be arrows")
+  } else if store != null && (is_obj(store) == false
+    || is_arrow(hash_map.get_or(store, "get", null)) == false
+    || is_arrow(hash_map.get_or(store, "set", null)) == false) {
+    error.raise("http-ratelimit: store must be a record " +
+      "{ get: (k) ~> v, set: (k, v) ~> u } of arrows")
+  } else {
+    do {
+      getf := if store == null { null } else { store.get }
+      setf := if store == null { null } else { store.set }
+
+      --- the no-store counter map inside ctx.state.
+      counters_of := (ctx) ~> do {
+        m := hash_map.get_or(state_of(ctx), skey, {})
+        if is_obj(m) { m } else { {} }
+      }
+
+      (ctx, next) ~> do {
+        key := str_of(keyf(ctx))
+        now := nowf()
+        prev := if store == null {
+          hash_map.get_or(counters_of(ctx), key, null)
+        } else {
+          getf(key)
+        }
+        ev := if algo == "window" {
+          window_eval(prev, now, limit, wms)
+        } else {
+          bucket_eval(prev, now, limit, wms, burst)
+        }
+        newc := if algo == "window" {
+          { start: ev.start, count: ev.count }
+        } else {
+          { tokens: ev.tokens, ts: ev.ts }
+        }
+        if store != null {
+          setf(key, newc)
+        }
+        rl_pairs := [
+          ["x-ratelimit-limit", str_of(limit)],
+          ["x-ratelimit-remaining", str_of(ev.remaining)],
+          ["x-ratelimit-reset",
+            str_of(math.ceil(ev.reset_ms / 1000))]
+        ]
+        --- state carrying the updated counter map (no-store mode).
+        state_with := (st) ~> if store != null {
+          st
+        } else {
+          do {
+            m := counters_of(ctx)
+            m2 := hash_map.set(m, key, newc)
+            hash_map.set(st, skey, m2)
+          }
+        }
+        if ev.allowed {
+          ctx2 := if store != null {
+            ctx
+          } else {
+            do {
+              m := counters_of(ctx)
+              hash_map.merge(ctx, { state: hash_map.set(
+                state_of(ctx), skey, hash_map.set(m, key, newc)) })
+            }
+          }
+          r := next(ctx2)
+          rst := hash_map.get_or(r, "state", state_of(ctx))
+          { resp: with_headers(r.resp, rl_pairs),
+            state: state_with(rst) }
+        } else {
+          retry := math.ceil(ev.retry_ms / 1000)
+          retry2 := if retry < 1 { 1 } else { retry }
+          { resp: { status: 429,
+              headers: put_hs({}, [
+                ...rl_pairs,
+                ["retry-after", str_of(retry2)]]),
+              body: "rate limit exceeded" },
+            state: state_with(state_of(ctx)) }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,3 @@
+-- lib-http-ratelimit: modules this package provides (entry defaults to
+-- src/index.hnl; N modules resolve to src/<name>/index.hnl).
+{ modules: ["http-ratelimit"], name: "http-ratelimit", description: "Rate limiting middleware for handl HTTP servers: token-bucket and fixed-window algorithms over the http-middleware (ctx, next) ~> {resp, state} protocol, per-key isolation, 429 + Retry-After + X-RateLimit-* headers, injectable clock and {get,set} store port.", license: "MIT", keywords: ["http", "rate-limit", "middleware", "ratelimit", "stdlib", "handl"], homepage: "https://github.com/handl-lang/lib-http-ratelimit" }

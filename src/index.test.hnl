@@ -1,0 +1,289 @@
+--- http-ratelimit.test -- coverage for the rate-limit middleware
+--- (`src/index.hnl`): token bucket + fixed window algorithms, allow ->
+--- 429 transitions, Retry-After / X-RateLimit-* headers, per-key
+--- isolation, window reset, the {get,set} store port, default key
+--- extraction, and ctx.state threading (no-store mode).
+
+from "./index" import * as rl
+-- str.*/hash_map.* are registered wire names — no import needed.
+
+-- ---------------------------------------------------------------------
+-- fixtures
+-- ---------------------------------------------------------------------
+
+mkreq := (m, p) ~> do {
+  { method: m, path: p, query: "", version: "HTTP/1.1",
+    headers: {}, body: "", body_bytes: null }
+}
+
+mkreqh := (m, p, hs) ~> do {
+  { method: m, path: p, query: "", version: "HTTP/1.1",
+    headers: hs, body: "", body_bytes: null }
+}
+
+ctx_of := (req, state) ~> { req: req, state: state }
+
+next_ok := (ctx) ~> do {
+  { resp: { status: 200, body: "ok" }, state: ctx.state }
+}
+
+geth := (resp, k) ~> hash_map.get_or(
+  hash_map.get_or(resp, "headers", {}), k, null)
+
+--- run one request through `mw` threading the returned state forward
+--- (the no-store mode's persistence mechanism).
+step := (mw, req, state) ~> do {
+  r := mw(ctx_of(req, state), next_ok)
+  { resp: r.resp, state: r.state }
+}
+
+-- a fixed clock per middleware instance; time travel = new instance
+-- sharing the threaded state.
+clock := (ms) ~> () ~> ms
+
+-- ---------------------------------------------------------------------
+-- default_key
+-- ---------------------------------------------------------------------
+
+test_key_xff := assert rl.default_key(ctx_of(
+  mkreqh("GET", "/", hash_map.set({}, "x-forwarded-for",
+    "1.2.3.4, 5.6.7.8")), {})) = "1.2.3.4"
+
+test_key_xff_single := assert rl.default_key(ctx_of(
+  mkreqh("GET", "/", hash_map.set({}, "x-forwarded-for",
+    "  9.9.9.9 ")), {})) = "9.9.9.9"
+
+test_key_x_real_ip := assert rl.default_key(ctx_of(
+  mkreqh("GET", "/", hash_map.set({}, "x-real-ip", "10.0.0.1")),
+  {})) = "10.0.0.1"
+
+test_key_unknown := assert rl.default_key(
+  ctx_of(mkreq("GET", "/"), {})) = "unknown"
+
+test_key_fn_override := assert do {
+  mw := rl.rate_limit({ limit: 1, window: 60,
+    now: clock(0), key_fn: (ctx) ~> ctx.req.path })
+  r1 := step(mw, mkreq("GET", "/a"), {})
+  r2 := step(mw, mkreq("GET", "/b"), r1.state)
+  r3 := step(mw, mkreq("GET", "/a"), r2.state)
+  r1.resp.status == 200 && r2.resp.status == 200
+    && r3.resp.status == 429
+}
+
+-- ---------------------------------------------------------------------
+-- token bucket (default algorithm)
+-- ---------------------------------------------------------------------
+
+bucket_mw := rl.rate_limit({ limit: 2, window: 60, now: clock(0) })
+
+test_bucket_allow_then_deny := assert do {
+  r1 := step(bucket_mw, mkreq("GET", "/"), {})
+  r2 := step(bucket_mw, mkreq("GET", "/"), r1.state)
+  r3 := step(bucket_mw, mkreq("GET", "/"), r2.state)
+  r1.resp.status == 200 && r2.resp.status == 200
+    && r3.resp.status == 429
+}
+
+test_bucket_headers_allow := assert do {
+  r := step(bucket_mw, mkreq("GET", "/"), {})
+  geth(r.resp, "x-ratelimit-limit") == "2" &&
+  geth(r.resp, "x-ratelimit-remaining") == "1" &&
+  geth(r.resp, "x-ratelimit-reset") != null
+}
+
+test_bucket_retry_after := assert do {
+  r1 := step(bucket_mw, mkreq("GET", "/"), {})
+  r2 := step(bucket_mw, mkreq("GET", "/"), r1.state)
+  r3 := step(bucket_mw, mkreq("GET", "/"), r2.state)
+  r3.resp.status == 429 &&
+  geth(r3.resp, "retry-after") == "30" &&
+  geth(r3.resp, "x-ratelimit-remaining") == "0" &&
+  hash_map.get_or(r3.resp, "body", "") == "rate limit exceeded"
+}
+
+--- half a window later one token has refilled -> allowed again.
+test_bucket_refill := assert do {
+  mw0 := rl.rate_limit({ limit: 2, window: 60, now: clock(0) })
+  mw30 := rl.rate_limit({ limit: 2, window: 60, now: clock(30000) })
+  r1 := step(mw0, mkreq("GET", "/"), {})
+  r2 := step(mw0, mkreq("GET", "/"), r1.state)
+  r3 := step(mw0, mkreq("GET", "/"), r2.state)   -- 429, tokens ~0
+  r4 := step(mw30, mkreq("GET", "/"), r3.state)  -- +30s -> 1 token
+  r4.resp.status == 200
+}
+
+--- burst above limit: burst 4 with limit 2 allows 4 immediate.
+test_bucket_burst := assert do {
+  mw := rl.rate_limit({ limit: 2, window: 60, burst: 4,
+    now: clock(0) })
+  r1 := step(mw, mkreq("GET", "/"), {})
+  r2 := step(mw, mkreq("GET", "/"), r1.state)
+  r3 := step(mw, mkreq("GET", "/"), r2.state)
+  r4 := step(mw, mkreq("GET", "/"), r3.state)
+  r5 := step(mw, mkreq("GET", "/"), r4.state)
+  r1.resp.status == 200 && r2.resp.status == 200
+    && r3.resp.status == 200 && r4.resp.status == 200
+    && r5.resp.status == 429
+}
+
+-- ---------------------------------------------------------------------
+-- fixed window
+-- ---------------------------------------------------------------------
+
+win_mw := rl.rate_limit({ limit: 2, window: 60,
+  algorithm: "window", now: clock(0) })
+
+test_window_allow_then_deny := assert do {
+  r1 := step(win_mw, mkreq("GET", "/"), {})
+  r2 := step(win_mw, mkreq("GET", "/"), r1.state)
+  r3 := step(win_mw, mkreq("GET", "/"), r2.state)
+  r1.resp.status == 200 && geth(r1.resp, "x-ratelimit-remaining") == "1"
+    && r2.resp.status == 200
+    && geth(r2.resp, "x-ratelimit-remaining") == "0"
+    && r3.resp.status == 429
+}
+
+test_window_retry_after := assert do {
+  r1 := step(win_mw, mkreq("GET", "/"), {})
+  r2 := step(win_mw, mkreq("GET", "/"), r1.state)
+  r3 := step(win_mw, mkreq("GET", "/"), r2.state)
+  geth(r3.resp, "retry-after") == "60"
+}
+
+test_window_reset := assert do {
+  mw0 := rl.rate_limit({ limit: 1, window: 60,
+    algorithm: "window", now: clock(0) })
+  mw61 := rl.rate_limit({ limit: 1, window: 60,
+    algorithm: "window", now: clock(61000) })
+  r1 := step(mw0, mkreq("GET", "/"), {})
+  r2 := step(mw0, mkreq("GET", "/"), r1.state)   -- 429
+  r3 := step(mw61, mkreq("GET", "/"), r2.state)  -- new window
+  r2.resp.status == 429 && r3.resp.status == 200
+}
+
+test_window_subwindow_boundary := assert do {
+  mw0 := rl.rate_limit({ limit: 1, window: { ms: 500 },
+    algorithm: "window", now: clock(0) })
+  mw499 := rl.rate_limit({ limit: 1, window: { ms: 500 },
+    algorithm: "window", now: clock(499) })
+  mw501 := rl.rate_limit({ limit: 1, window: { ms: 500 },
+    algorithm: "window", now: clock(501) })
+  r1 := step(mw0, mkreq("GET", "/"), {})
+  r2 := step(mw499, mkreq("GET", "/"), r1.state)  -- still same window
+  r3 := step(mw501, mkreq("GET", "/"), r2.state)  -- rolled over
+  r1.resp.status == 200 && r2.resp.status == 429
+    && r3.resp.status == 200
+}
+
+-- ---------------------------------------------------------------------
+-- per-key isolation (default unknown key shares one bucket)
+-- ---------------------------------------------------------------------
+
+test_per_key_isolation := assert do {
+  mw := rl.rate_limit({ limit: 1, window: 60,
+    key_fn: (ctx) ~> ctx.req.path, now: clock(0) })
+  r1 := step(mw, mkreq("GET", "/a"), {})
+  r2 := step(mw, mkreq("GET", "/b"), r1.state)
+  r3 := step(mw, mkreq("GET", "/a"), r2.state)
+  r4 := step(mw, mkreq("GET", "/b"), r3.state)
+  r1.resp.status == 200 && r2.resp.status == 200
+    && r3.resp.status == 429 && r4.resp.status == 429
+}
+
+test_unknown_key_shared := assert do {
+  mw := rl.rate_limit({ limit: 1, window: 60, now: clock(0) })
+  r1 := step(mw, mkreq("GET", "/a"), {})
+  r2 := step(mw, mkreq("GET", "/different-path"), r1.state)
+  -- no forwarding headers -> both requests share the "unknown" key
+  r1.resp.status == 200 && r2.resp.status == 429
+}
+
+-- ---------------------------------------------------------------------
+-- store port ({get,set})
+-- ---------------------------------------------------------------------
+
+--- store whose get always misses and whose set reports the write.
+store_spy := {
+  get: (k) ~> null,
+  set: (k, v) ~> error.raise("SET:" + k + "=" + type.to_string(v))
+}
+
+test_store_write_on_allow := assert match error.try((x) ~> do {
+  mw := rl.rate_limit({ limit: 5, window: 60, now: clock(0),
+    store: store_spy })
+  step(mw, mkreq("GET", "/"), {})
+}) {
+  err(e): str.find(e, "SET:unknown=") >= 0, ok(_): false }
+
+--- a store returning an exhausted window state -> immediate 429.
+store_full := {
+  get: (k) ~> { start: 0, count: 2 },
+  set: (k, v) ~> null
+}
+
+test_store_preloaded_deny := assert do {
+  mw := rl.rate_limit({ limit: 2, window: 60,
+    algorithm: "window", now: clock(0), store: store_full })
+  r := step(mw, mkreq("GET", "/"), {})
+  r.resp.status == 429 && geth(r.resp, "retry-after") == "60"
+}
+
+--- bucket state from the store: 0.5 tokens -> deny with ~30s retry.
+store_half := {
+  get: (k) ~> { tokens: 0.5, ts: 0 },
+  set: (k, v) ~> null
+}
+
+test_store_bucket_deny := assert do {
+  mw := rl.rate_limit({ limit: 2, window: 60, now: clock(0),
+    store: store_half })
+  r := step(mw, mkreq("GET", "/"), {})
+  r.resp.status == 429
+}
+
+test_bad_store_raises := assert match error.try(
+  (x) ~> rl.rate_limit({ store: {} })) {
+  err(e): true, ok(_): false }
+
+-- ---------------------------------------------------------------------
+-- misc / protocol
+-- ---------------------------------------------------------------------
+
+test_deny_skips_next := assert do {
+  mw := rl.rate_limit({ limit: 1, window: 60, now: clock(0) })
+  r1 := step(mw, mkreq("GET", "/"), {})
+  -- a second request at the same instant must 429 WITHOUT calling next
+  -- (this next raises; reaching it fails the test)
+  r2 := mw(ctx_of(mkreq("GET", "/"), r1.state),
+    (_c) ~> error.raise("next must not run"))
+  hash_map.get_or(r2.resp, "status", 0) == 429
+}
+
+test_state_key_custom := assert do {
+  mw := rl.rate_limit({ limit: 1, window: 60, now: clock(0),
+    state_key: "rl_custom" })
+  r1 := step(mw, mkreq("GET", "/"), {})
+  r2 := step(mw, mkreq("GET", "/"), r1.state)
+  hash_map.has(r1.state, "rl_custom") && r2.resp.status == 429
+}
+
+test_window_record_seconds := assert do {
+  mw := rl.rate_limit({ limit: 1, window: { seconds: 30 },
+    algorithm: "window", now: clock(0) })
+  mw29 := rl.rate_limit({ limit: 1, window: { seconds: 30 },
+    algorithm: "window", now: clock(29000) })
+  mw31 := rl.rate_limit({ limit: 1, window: { seconds: 30 },
+    algorithm: "window", now: clock(31000) })
+  r1 := step(mw, mkreq("GET", "/"), {})
+  r2 := step(mw29, mkreq("GET", "/"), r1.state)
+  r3 := step(mw31, mkreq("GET", "/"), r2.state)
+  r2.resp.status == 429 && r3.resp.status == 200
+}
+
+test_bad_algorithm_raises := assert match error.try(
+  (x) ~> rl.rate_limit({ algorithm: "leaky" })) {
+  err(e): true, ok(_): false }
+
+test_bad_window_raises := assert match error.try(
+  (x) ~> rl.rate_limit({ window: "soon" })) {
+  err(e): true, ok(_): false }
