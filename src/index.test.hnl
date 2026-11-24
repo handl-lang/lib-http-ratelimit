@@ -47,18 +47,18 @@ clock := (ms) ~> () ~> ms
 
 test_key_xff := assert rl.default_key(ctx_of(
   mkreqh("GET", "/", hash_map.set({}, "x-forwarded-for",
-    "1.2.3.4, 5.6.7.8")), {})) = "1.2.3.4"
+    "1.2.3.4, 5.6.7.8")), {})) == "1.2.3.4"
 
 test_key_xff_single := assert rl.default_key(ctx_of(
   mkreqh("GET", "/", hash_map.set({}, "x-forwarded-for",
-    "  9.9.9.9 ")), {})) = "9.9.9.9"
+    "  9.9.9.9 ")), {})) == "9.9.9.9"
 
 test_key_x_real_ip := assert rl.default_key(ctx_of(
   mkreqh("GET", "/", hash_map.set({}, "x-real-ip", "10.0.0.1")),
-  {})) = "10.0.0.1"
+  {})) == "10.0.0.1"
 
 test_key_unknown := assert rl.default_key(
-  ctx_of(mkreq("GET", "/"), {})) = "unknown"
+  ctx_of(mkreq("GET", "/"), {})) == "unknown"
 
 test_key_fn_override := assert do {
   mw := rl.rate_limit({ limit: 1, window: 60,
